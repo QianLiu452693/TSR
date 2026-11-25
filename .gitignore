@@ -1,0 +1,6 @@
+ed19 
+ed19.pub 
+output/
+*.sqlite
+*.db
+*.csv
