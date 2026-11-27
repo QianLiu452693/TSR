@@ -1,387 +1,280 @@
-# 犯罪场景时序知识图谱（Crime TKG）与时空风险推理
+# Crime Scene Temporal Knowledge Graph (Crime TKG) and Spatiotemporal Risk Reasoning
 
-基于标准化犯罪记录构建的犯罪场景时序知识图谱（Temporal Knowledge Graph, TKG），并在图谱之上完成多尺度时空风险推理与时间留出验证。图谱可导出为 Neo4j 可导入格式，支持按批次增量更新。
+A crime-scene temporal knowledge graph (TKG) built from standardized crime records, with multi-scale spatiotemporal risk reasoning evaluated under temporal hold-out validation. The graph can be exported in a Neo4j-importable format and supports batch incremental updates.
 
+- **Dataset**: Figshare, DOI [10.6084/m9.figshare.28106939](https://doi.org/10.6084/m9.figshare.28106939)
+- **Final scale**: 302,710 entities and 1,916,810 quadruples
+- **Reasoning protocol**: temporal hold-out validation, compared against a near-repeat baseline
 
+---
 
-* **数据来源**：Figshare 数据集，DOI [10.6084/m9.figshare.28106939](https://doi.org/10.6084/m9.figshare.28106939)
+## Table of Contents
 
-* **最终规模**：302,710 个实体，1,916,810 条四元组
+- [Overview](#overview)
+- [Dataset and Cleaning Funnel](#dataset-and-cleaning-funnel)
+- [Spatiotemporal Alignment and Grid Coding](#spatiotemporal-alignment-and-grid-coding)
+- [Graph Structure](#graph-structure)
+  - [Entity Types](#entity-types)
+  - [Relation Types](#relation-types)
+- [Repository Structure](#repository-structure)
+- [Requirements and Installation](#requirements-and-installation)
+- [Quick Start](#quick-start)
+- [Neo4j Import](#neo4j-import)
+- [Incremental Update Mechanism](#incremental-update-mechanism)
+- [Spatiotemporal Reasoning Model](#spatiotemporal-reasoning-model)
+- [Key Results](#key-results)
+- [Output Files](#output-files)
+- [Limitations and Notes](#limitations-and-notes)
+- [Citation](#citation)
 
-* **推理方式**：时间留出检验，与近重复（近期案件数）基线对照
 
+---
 
+## Overview
 
-***
+This project cleans and aligns raw crime records into standardized events, extracts crime-type, geographic, and temporal entities, constructs quadruples by rule-based extraction, and corrects edges with graph-based neighborhood aggregation. The resulting temporal knowledge graph is importable into a graph database and supports incremental updates. On top of the graph, a multi-scale spatiotemporal risk reasoning model is trained and evaluated under temporal hold-out to assess hotspot coverage.
 
-## 目录
+> Causal-edge re-estimation is computed by NumPy neighborhood aggregation, **not** by a deep graph neural network. The reasoning model uses shared features with per-task logistic regression heads; see [Spatiotemporal Reasoning Model](#spatiotemporal-reasoning-model).
 
+## Dataset and Cleaning Funnel
 
+The pipeline starts from 1,030,854 raw records. After deduplication, outlier removal, and field completion, 724,399 records with complete fields remain.
 
-* [项目简介](#项目简介)
+| Stage | Rule | Count |
+| --- | --- | ---: |
+| Raw records | — | 1,030,854 |
+| Case-number deduplication | Remove duplicates by case number | 65,999 |
+| Temporal outliers | Unparseable, or year outside 2000–2019 | 51,309 |
+| Irrelevant offense types | Non-street / non-community crime types | 99,938 |
+| Isolated points | DBSCAN outliers | 16,940 |
+| Administrative division | Point-in-polygon match against county-level boundaries | 703,955 |
+| Administrative backfill | Backfilled by nearest neighbor and court name | 20,444 |
+| Offense completion | Lexicon matching, supplemented by TF-IDF | 9,393 |
+| Manual review list | Insufficient similarity, sent to manual review | 4,813 |
+| **Cleaned** | **Records with complete fields** | **724,399** |
 
-* [数据来源与清洗漏斗](#数据来源与清洗漏斗)
+- The 4,813 offense records with insufficient similarity are kept in `manual_review_crime_type.csv`.
 
-* [时空对齐与网格编码](#时空对齐与网格编码)
+## Spatiotemporal Alignment and Grid Coding
 
-* [图谱结构](#图谱结构)
+- **Time standardization**: Unified to ISO 8601 format `YYYY-MM-DDThh:mm:ss+08:00`, with an accompanying Unix timestamp.
+- **Coordinate projection**: After Gauss–Krüger projection, 500 m grids are defined within each prefecture-level city.
+- **Grid code**: 12-digit code, structured as `6-digit prefecture code + 3-digit X + 3-digit Y`, yielding 209,315 grids.
 
+## Graph Structure
 
-  * [实体类型](#实体类型)
+Each quadruple contains: `entity1_id`, `relation_type`, `entity2_id`, `iso8601_timestamp`, `confidence`.
 
-  * [关系类型](#关系类型)
+### Entity Types
 
-* [目录结构](#目录结构)
+Only entities actually appearing in the data are retained; **empty grids are not synthesized**.
 
-* [环境与安装](#环境与安装)
+| Category | Count | Composition |
+| --- | ---: | --- |
+| Crime types | 18 | Property crimes 7, crimes against personal rights 6, public-order offenses 5 |
+| Geospatial | 212,362 | Province 27, prefecture 328, county 2,692, 500 m urban grid 209,315 |
+| Time units | 90,330 | Hour 82,374, day 6,674, week 1,042, month 240 |
 
-* [快速开始](#快速开始)
+Entity attributes:
 
-* [Neo4j 导入](#neo4j-导入)
+- Each offense type is annotated with its criminal-law article, constitutive elements, and secondary category. For example, theft (larceny) corresponds to Criminal Law Article 264 with 595,453 cases; robbery, snatch, and fraud are likewise written according to the specific provisions.
+- Grids store the Gauss–Krüger coordinate bounds and per-square-kilometer case density (case count / 0.25). The source table has no population denominator, so **population density is not filled in**.
+- Hour and day entities carry time-of-day, weekend, and holiday markers.
 
-* [增量更新机制](#增量更新机制)
+### Relation Types
 
-* [时空推理模型](#时空推理模型)
+| Relation group | Sub-relation | Count |
+| --- | --- | ---: |
+| Spatiotemporal | Occurs at time | 724,399 |
+| Spatiotemporal | Co-located in same grid | 724,399 |
+| Spatiotemporal | Spatial hierarchy membership | 212,335 |
+| Spatiotemporal | Adjacent region association | 138,231 |
+| Spatiotemporal | Temporal granularity membership | 95,722 |
+| Spatiotemporal | Short-term succession within 24 h | 21,136 |
+| Causal | Geographic crime generation | 441 |
+| Type | Type exclusion | 122 |
+| Type | Type transition | 14 |
+| Type | Type similarity | 11 |
 
-* [主要结果](#主要结果)
+Confidence and re-estimation rules:
 
-* [输出文件说明](#输出文件说明)
+- Rule edges have confidence 1.0; short-term succession edges have confidence 0.98.
+- Geographic crime-generation edges are first extracted by co-occurrence lift, then re-estimated by two-layer grid neighborhood mean aggregation; confidence is the average of the rule result and the neighborhood result. After neighborhood re-estimation, 430 rule edges are retained and 11 edges are supplemented by machine learning; 41 edges with confidence below 0.35 are removed.
+- **Directed cross-type causal edges are not written.** Among 24-hour succession transitions, no type pair simultaneously satisfies: count ≥ 30, forward direction ≥ 1.2× the reverse, and lift ≥ 1.5. The closest pair, snatch and robbery, has only 31 and 33 occurrences on the two sides with near-symmetric directionality, so it is kept only in type relations.
 
-* [已知限制与声明](#已知限制与声明)
+## Repository Structure
 
-* [引用](#引用)
-
-
-
-
-
-***
-
-## 项目简介
-
-本项目将原始犯罪文书记录清洗、对齐为标准化事件，抽取犯罪类型、地理空间与时间单元三类实体，按规则抽取四元组并在图上做邻域聚合校正，形成可导入图数据库、支持增量更新的时序知识图谱；随后在图谱上训练多尺度时空风险推理模型，按时间留出方式评估网格风险覆盖能力。
-
-> 图谱因果边的重估基于 NumPy 邻域聚合计算，
->
-> **不是深度图神经网络训练**
->
-> ；推理模型为带共享特征的逻辑回归头，详见
->
-> [时空推理模型](#时空推理模型)
->
-> 。
-
-## 数据来源与清洗漏斗
-
-原始记录 1,030,854 条，经去重、异常剔除与字段补全后，得到 724,399 条字段完整的清洗记录。
-
-
-
-| 环节       | 处理规则                 | 数量          |
-| -------- | -------------------- | ----------- |
-| 原始记录     | —                    | 1,030,854   |
-| 案号去重     | 按案件编号去除重复            | 65,999      |
-| 时间异常剔除   | 无法解析，或年份超出 2000–2019 | 51,309      |
-| 类型不相关剔除  | 非街面 / 社区犯罪类型         | 99,938      |
-| 孤立点剔除    | DBSCAN 离群点           | 16,940      |
-| 行政区划归属   | 县级矢量面点面包含命中          | 703,955     |
-| 行政区划回补   | 近邻与法院名称回补            | 20,444      |
-| 罪名补全     | 词典匹配为主，TF-IDF 补充     | 9,393       |
-| 人工复核清单   | 相似度不足，转入人工复核         | 4,813       |
-| **清洗完成** | **字段完整记录**           | **724,399** |
-
-
-
-* 罪名相似度不足的 4,813 条记录留存于 `manual_review_crime_type.csv`。
-
-## 时空对齐与网格编码
-
-
-
-* **时间标准化**：统一为 ISO 8601 格式 `YYYY-MM-DDThh:mm:ss+08:00`，并附带 Unix 时间戳。
-
-* **坐标投影**：经高斯–克吕格投影后，按地级市划分 500 米网格。
-
-* **网格编码**：12 位编码，结构为 `6 位地级代码 + 3 位 X 坐标 + 3 位 Y 坐标`，共 209,315 个网格。
-
-## 图谱结构
-
-四元组字段为：`entity1_id`、`relation_type`、`entity2_id`、`iso8601_timestamp`、`confidence`。
-
-### 实体类型
-
-实体仅保留数据中真实出现过的对象，**不补空网格**。
-
-
-
-| 类别   | 数量      | 构成                                    |
-| ---- | ------- | ------------------------------------- |
-| 犯罪类型 | 18      | 侵犯财产罪 7、侵犯公民人身权利罪 6、妨害社会管理秩序罪 5       |
-| 地理空间 | 212,362 | 省 27、地级 328、县 2,692、500 米城市网格 209,315 |
-| 时间单元 | 90,330  | 小时 82,374、日 6,674、周 1,042、月 240       |
-
-实体属性说明：
-
-
-
-* 每个罪名挂载刑法条文、构成要件与二级类型。例如盗窃罪对应《刑法》第 264 条，案件数 595,453；抢劫、抢夺、诈骗同样按分则条款写入。
-
-* 网格保存高斯–克吕格坐标范围与每平方公里案件密度（案件数 / 0.25）。源表无人口分母，**未填写人口密度**。
-
-* 小时与日实体附带时段、周末、节假日标记。
-
-### 关系类型
-
-
-
-| 关系大类 | 关系细分        | 条数      |
-| ---- | ----------- | ------- |
-| 时空关联 | 发生于时刻       | 724,399 |
-| 时空关联 | 同一网格关联      | 724,399 |
-| 时空关联 | 空间层级隶属      | 212,335 |
-| 时空关联 | 相邻区域关联      | 138,231 |
-| 时空关联 | 时间粒度隶属      | 95,722  |
-| 时空关联 | 24 小时内短时序相继 | 21,136  |
-| 因果关联 | 地理致罪        | 441     |
-| 类型关联 | 类型互斥        | 122     |
-| 类型关联 | 类型转化        | 14      |
-| 类型关联 | 类型相似        | 11      |
-
-置信度与重估规则：
-
-
-
-* 规则边置信度为 1.0，短时序相继边为 0.98。
-
-* 地理致罪边先按共现提升度抽取，再经两层网格邻域均值聚合重估，置信度取规则结果与邻域结果的平均；其中规则边经邻域重估后保留 430 条，机器学习补充 11 条，置信度低于 0.35 的 41 条已删除。
-
-* **跨类型有向因果边未写入**：24 小时相继转移中，没有任何一对类型同时满足 “次数 ≥ 30、正向不少于反向的 1.2 倍、提升度 ≥ 1.5”。最接近的抢夺与抢劫两侧仅 31 次与 33 次，方向几乎对称，因此仅保留在类型关联中。
-
-## 目录结构
-
-
-
-```
+```text
 output/
-├── cleaned_crime_records.csv        # 标准化事件表
-├── entities.csv                    # 实体词典
-├── tkg_quadruples.csv              # 可直接导入 Neo4j 的四元组
-├── manual_review_crime_type.csv    # 罪名人工复核清单
+├── cleaned_crime_records.csv        # Standardized event table
+├── entities.csv                    # Entity dictionary
+├── tkg_quadruples.csv              # Neo4j-importable quadruples
+├── manual_review_crime_type.csv    # Manual review list for offenses
 └── tkg/
-    ├── crime_tkg.sqlite            # 图谱库（SQLite）
-    ├── tkg_report.json             # 图谱规模统计
-    ├── neo4j/                      # 节点、关系 CSV 与 import.cypher
+    ├── crime_tkg.sqlite             # Graph store (SQLite)
+    ├── tkg_report.json              # Graph scale statistics
+    ├── neo4j/                       # Node/relation CSVs and import.cypher
     └── reason/
-        ├── reason_report.json      # 推理全量指标
-        ├── hotspot_24h.csv         # 24 小时高风险网格名单
-        ├── hotspot_7d.csv           # 7 天高风险网格名单
-        ├── hotspot_30d.csv          # 30 天高风险网格名单
-        ├── type_C0101_30d.csv       # 盗窃 30 天专项名单
-        └── explanations.csv         # 每条名单的历史依据
+        ├── reason_report.json        # Full reasoning metrics
+        ├── hotspot_24h.csv          # 24 h high-risk hotspot list
+        ├── hotspot_7d.csv             # 7-day high-risk hotspot list
+        ├── hotspot_30d.csv            # 30-day high-risk hotspot list
+        ├── type_C0101_30d.csv        # Theft-specific 30-day list
+        └── explanations.csv           # Historical evidence for each entry
 ```
 
-## 环境与安装
+## Requirements and Installation
 
+- Python 3 (launch with `py -3` on Windows).
+- Main dependencies: NumPy, scikit-learn (DBSCAN, TF-IDF, logistic regression, etc.); pinned versions are maintained in the repository `requirements.txt`.
+- Neo4j is optional, required only for graph-database visualization and querying; Neo4j was not started on this machine.
 
+Install dependencies:
 
-* Python 3（Windows 下使用 `py -3` 启动）。
-
-* 主要依赖：NumPy、scikit-learn（DBSCAN、TF-IDF、逻辑回归等）；完整版本与锁定依赖以仓库 `requirements.txt` 为准。
-
-* Neo4j 为可选组件，仅在需要图数据库可视化与查询时安装；本机未启动 Neo4j。
-
-安装依赖：
-
-
-
-```
+```bash
 pip install -r requirements.txt
 ```
 
-## 快速开始
+## Quick Start
 
-重新计算时空推理结果：
+Recompute the spatiotemporal reasoning results:
 
-
-
-```
+```bash
 py -3 run_tkg_reason.py
 ```
 
-运行结果输出至 `output/tkg/reason/`，全量指标见 `reason_report.json`。
+Results are written to `output/tkg/reason/`; full metrics are in `reason_report.json`.
 
-## Neo4j 导入
+## Neo4j Import
 
-节点、关系与导入脚本位于 `output/tkg/neo4j/`：
+Nodes, relations, and the import script are located in `output/tkg/neo4j/`:
 
+1. Copy the CSVs in this directory to the Neo4j `import` directory;
+2. Run the import script:
 
-
-1. 将该目录下的 CSV 复制到 Neo4j 的 `import` 目录；
-
-2. 执行导入脚本：
-
-
-
-```
+```bash
 cypher-shell -f import.cypher
 ```
 
-脚本会建立实体唯一约束，以及层级、罪名编码、空间层级、时间粒度与关系时间索引。
+The script creates unique entity constraints, as well as indexes for hierarchy, offense codes, spatial hierarchy, temporal granularity, and relation time.
 
-## 增量更新机制
+## Incremental Update Mechanism
 
-增量更新按 **规则匹配 → 冲突拒绝 → 分层写入** 执行。
+Updates follow **rule matching → conflict rejection → layered writing**.
 
-### 输入要求
+### Input Requirements
 
-新案件 CSV 必须为已标准化记录，至少包含以下字段：
+The new-case CSV must contain already standardized records with at least the following fields:
 
+| Field | Description |
+| --- | --- |
+| `case_number` | Case identifier |
+| `crime_type_id` | Offense entity identifier |
+| `grid_id` | Grid identifier |
+| `time_id` | Time-unit identifier |
+| `iso8601` | ISO 8601 timestamp |
+| `unix_timestamp` | Unix timestamp |
+| `city_code` | Prefecture-level code |
+| `grid_x` | Grid X coordinate code |
+| `grid_y` | Grid Y coordinate code |
 
+### Conflict and Writing Rules
 
-| 字段               | 说明           |
-| ---------------- | ------------ |
-| `case_number`    | 案件编号         |
-| `crime_type_id`  | 罪名实体标识       |
-| `grid_id`        | 网格标识         |
-| `time_id`        | 时间单元标识       |
-| `iso8601`        | ISO 8601 时间戳 |
-| `unix_timestamp` | Unix 时间戳     |
-| `city_code`      | 地级代码         |
-| `grid_x`         | 网格 X 坐标编码    |
-| `grid_y`         | 网格 Y 坐标编码    |
+- Unknown offense type or unknown grid: recorded in the conflict table and rejected.
+- Existing case number: skipped.
+- New time units, new edges, and `event_count` changes: written separately.
+- Attribute changes are kept in `attribute_history`; batch records are kept in `update_log`.
 
-### 冲突与写入规则
+### Commands
 
+```bash
+# Import a specified new-case file
+py -3 run_tkg_update.py --input <new_cases.csv>
 
-
-* 未知罪名或未知网格：记入冲突表并拒绝写入。
-
-* 已有案号：跳过。
-
-* 新时间单元、新边与 `event_count` 变更：分别写入。
-
-* 属性变更：留存于 `attribute_history`；批次记录留存于 `update_log`。
-
-### 命令
-
-
-
-```
-# 导入指定新案件文件
-py -3 run_tkg_update.py --input <新案件.csv>
-
-# 按计划周期更新
+# Update on a scheduled cycle
 py -3 run_tkg_update.py --schedule week
 
-# 到点才执行计划更新
-py -3 run_tkg_update.py --input <新案件.csv> --if-due
+# Run scheduled update only when due
+py -3 run_tkg_update.py --input <new_cases.csv> --if-due
 ```
 
-`--schedule` 取值：`day`、`week`、`month`、`manual`。
+`--schedule` accepts: `day`, `week`, `month`, `manual`.
 
-> 更新链路已用 5 条重复案件与 3 条平移 5 小时的样例验证：5 条重复被跳过，3 条写入后已从库中撤回；当前库仍为 724,399 条真实案件。
+> The update pipeline was validated with 5 duplicate cases and 3 cases shifted by 5 hours: the 5 duplicates were skipped, and the 3 inserted cases have been withdrawn from the store; the current database still holds 724,399 real cases.
 
-## 时空推理模型
+## Spatiotemporal Reasoning Model
 
-### 实验设置
+### Experimental Setup
 
+- **Validation protocol**: temporal hold-out; training uses only cases before the cutoff point, compared against a near-repeat baseline (ranked by case count in the previous 30 days).
+- **Evaluation cutoff**: 2019-08-13. The 30 days before this date still contain at least 1,000 cases; after that point document volume drops to dozens per month and cannot serve as a prediction window.
+- **Test windows**: three 30-day windows starting 2019-05-15, with 2,740, 1,953, and 1,013 cases respectively.
+- **High-risk tiers**: ranked by grid, top 1% for 24 h, top 2% for 7 days, and top 5% for 30 days.
 
+### Features and Model
 
-* **验证方式**：时间留出检验，训练仅使用截止时点之前的案件，并与近重复基线（按前 30 天案件数排序）对照。
+- Features: counts at grid itself, four-neighborhood, and county levels; night / weekend / holiday proportions; 14-day exponentially decayed near-repeat intensity.
+- The three tasks share these features, each with its own logistic regression head; coefficients for recent case counts are constrained to be non-negative.
+- In the 30-day model, the largest standardized weight is the share of theft in the last 90 days.
+- The source data has no population density, traffic flow, or suspect identifiers; these are **not** included in the model.
 
-* **评价截止**：2019-08-13。该日之前的 30 天仍有至少 1,000 起案件；此后文书数量降至每月数十起，不再作为预测窗口。
+## Key Results
 
-* **测试窗口**：自 2019-05-15 起各 30 天，案件数分别为 2,740、1,953、1,013。
+### Risk Coverage Comparison
 
-* **高风险档划分**：按网格排序，24 小时取前 1%，7 天取前 2%，30 天取前 5%。
+| Task | Model coverage | Previous-30-day case-count baseline |
+| --- | ---: | ---: |
+| 24 h | 22.7% | 16.1% |
+| 7 days | 21.5% | 18.3% |
+| 30 days | 36.9% | 20.5% |
+| Theft · 7 days | 27.2% | 17.6% |
+| Theft · 30 days | 37.6% | 20.1% |
 
-### 特征与模型
+- The theft-specific list is more concentrated than the all-offense list. Example: grid `GG330700197171` in Dongyang, Jinhua, had 24 thefts in the 90 days before decision-making, and 7 more within the held-out 30 days.
+- Fraud and intentional injury have only dozens to tens of cases per month in the held-out period, with unstable coverage; **they cannot be treated as standalone early-warning results**.
 
+### Other Measured Findings (deviating from planned targets; measured results prevail)
 
+- Parameters reduced from 17 to 3, a 5.67× compression; after teacher-score distillation, 30-day coverage drops from 36.9% to 26.8%; a lightweight model retrained with only two features reaches 9.6% coverage.
+- The weekly gated-recurrent model predicts theft with MAE of 79 cases; carrying over the previous week gives 31 cases, and the self-gated recurrent model does not beat the previous-week baseline.
+- Theft weekly average peaks in October (1,833) and bottoms in February (1,416); fraud peaks in May with no November rise; intentional injury peaks in June.
+- After stratifying by historical case volume, the night-time case share yields a 30-day theft risk ratio of 1.00; after propensity-score stratification it is 0.98. After removing the national weekly total, the weekly residual correlation between theft and intentional injury is -0.71.
+- There are 3,651 cross-county adjacent grid pairs; 28 have at least 5 24-hour near-repeats in training. The strongest are Nanchang Xihu → Donghu (12) and Wuhan Jiang'an → Jianghan (11). These 20 strong edges did not reappear in the following 90 days. County offense structures are very close; cross-province cosine similarities are almost all above 0.99, with no distinguishable latent association.
 
-* 特征：网格自身、四邻域、区县三档计数；夜间、周末、节假日占比；14 天指数衰减的近重复强度。
+## Output Files
 
-* 三个任务共用上述特征，各自配备一个逻辑回归头；近期案件数系数限制为非负。
+| Path | Description |
+| --- | --- |
+| `output/cleaned_crime_records.csv` | Standardized event table |
+| `output/entities.csv` | Entity dictionary |
+| `output/tkg_quadruples.csv` | Neo4j-importable quadruples |
+| `output/tkg/crime_tkg.sqlite` | Graph store (SQLite) |
+| `output/tkg/tkg_report.json` | Graph scale statistics |
+| `output/tkg/neo4j/` | Node/relation CSVs and `import.cypher` |
+| `output/tkg/reason/reason_report.json` | Full reasoning metrics |
+| `output/tkg/reason/hotspot_24h.csv` | 24 h high-risk hotspot list |
+| `output/tkg/reason/hotspot_7d.csv` | 7-day high-risk hotspot list |
+| `output/tkg/reason/hotspot_30d.csv` | 30-day high-risk hotspot list |
+| `output/tkg/reason/type_C0101_30d.csv` | Theft-specific 30-day list |
+| `output/tkg/reason/explanations.csv` | Historical evidence for each entry |
 
-* 30 天模型标准化后权重最大的特征为近 90 天盗窃占比。
+## Limitations and Notes
 
-* 源数据无人口密度、交通流量与嫌疑人标识，这些信息**未进入模型**。
+- Only objects actually appearing in the data are retained; empty grids are not synthesized.
+- The source data lacks population, traffic, and suspect identifiers; these fields are not fabricated.
+- Causal-edge re-estimation is NumPy neighborhood aggregation, not deep GNN training.
+- Neo4j was not started locally; the import steps require a configured Neo4j environment.
+- Types with insufficient samples, such as fraud and intentional injury, have unstable coverage and should not be used as standalone early-warning conclusions.
 
-## 主要结果
+## Citation
 
-### 风险覆盖对比
+Data source:
 
-
-
-| 任务      | 模型覆盖率 | 前 30 天案件数基线 |
-| ------- | ----- | ----------- |
-| 24 小时   | 22.7% | 16.1%       |
-| 7 天     | 21.5% | 18.3%       |
-| 30 天    | 36.9% | 20.5%       |
-| 盗窃・7 天  | 27.2% | 17.6%       |
-| 盗窃・30 天 | 37.6% | 20.1%       |
-
-
-
-* 盗窃专项名单比全部罪名名单更集中。示例：金华市东阳市网格 `GG330700197171` 在决策前 90 天有 24 起盗窃，留出的 30 天内又出现 7 起。
-
-* 诈骗与故意伤害在留出期每月仅数起至数十起，覆盖率不稳定，**不能单独作为专项预警效果**。
-
-### 其他实测结论（与方案目标不一致，以实测为准）
-
-
-
-* 参数从 17 个减至 3 个，压缩 5.67 倍；经教师分数蒸馏后，30 天覆盖由 36.9% 降至 26.8%；仅用两个特征重训的轻量模型覆盖率为 9.6%。
-
-* 周尺度门控循环预测盗窃的平均绝对误差为 79 起；沿用上一周结果为 31 起，自门控循环未超过上一周基线。
-
-* 盗窃周均峰值在 10 月（1,833 起），低点在 2 月（1,416 起）；诈骗峰值在 5 月，11 月未出现抬升；故意伤害峰值在 6 月。
-
-* 夜间案件占比按历史案件量分层后，未来 30 天发生盗窃的风险比为 1.00；倾向得分分层后为 0.98。扣除全国周总量后，盗窃与故意伤害的周残差相关系数为 -0.71。
-
-* 跨区县相邻网格共 3,651 对，训练期 24 小时近重复不少于 5 次的有 28 条；最强为南昌西湖区→东湖区（12 次）、武汉江岸区→江汉区（11 次）。这 20 条强边在随后 90 天均未再次出现。县与县罪名结构非常接近，跨省余弦相似度几乎都在 0.99 以上，未形成可区分的隐性关联。
-
-## 输出文件说明
-
-
-
-| 路径                                     | 说明                          |
-| -------------------------------------- | --------------------------- |
-| `output/cleaned_crime_records.csv`     | 标准化事件表                      |
-| `output/entities.csv`                  | 实体词典                        |
-| `output/tkg_quadruples.csv`            | 可直接导入 Neo4j 的四元组            |
-| `output/tkg/crime_tkg.sqlite`          | 图谱库（SQLite）                 |
-| `output/tkg/tkg_report.json`           | 图谱规模统计                      |
-| `output/tkg/neo4j/`                    | 节点、关系 CSV 与 `import.cypher` |
-| `output/tkg/reason/reason_report.json` | 推理全量指标                      |
-| `output/tkg/reason/hotspot_24h.csv`    | 24 小时高风险网格名单                |
-| `output/tkg/reason/hotspot_7d.csv`     | 7 天高风险网格名单                  |
-| `output/tkg/reason/hotspot_30d.csv`    | 30 天高风险网格名单                 |
-| `output/tkg/reason/type_C0101_30d.csv` | 盗窃 30 天专项名单                 |
-| `output/tkg/reason/explanations.csv`   | 每条名单的历史依据                   |
-
-## 已知限制与声明
-
-
-
-* 图谱只保留数据中真实出现的对象，不补充空网格。
-
-* 源数据缺少人口、交通与嫌疑人标识，相关字段未做编造。
-
-* 因果边重估为 NumPy 邻域聚合计算，未使用深度图神经网络训练。
-
-* 本机未启动 Neo4j，导入步骤需在配置 Neo4j 环境后执行。
-
-* 诈骗、故意伤害等样本量不足的类型，覆盖率结果不稳定，不宜单独用作专项预警结论。
-
-## 引用
-
-数据来源：
-
-
-
-```
+```text
 Figshare Dataset. DOI: 10.6084/m9.figshare.28106939
 https://doi.org/10.6084/m9.figshare.28106939
 ```
 
+
+
+The license for this repository is governed by the `LICENSE` file in the root directory; if none is provided, add an appropriate open-source license before public distribution.
